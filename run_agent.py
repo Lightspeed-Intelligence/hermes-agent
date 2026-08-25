@@ -5802,6 +5802,72 @@ class AIAgent:
 
 
 
+
+    _TIPSY_TRACKING_GUIDE_MARKER = "[tipsy-tracking-plan-runtime:original-skill]"
+
+    def _tracking_plan_has_active_workflow(self) -> bool:
+        # The custom tracking workflow is intentionally disabled.
+        return False
+
+    @staticmethod
+    def _tracking_plan_text_signal(text: str) -> bool:
+        source = str(text or "").lower()
+        strong_phrases = (
+            "设计埋点", "写埋点", "埋点方案", "新功能要埋点", "需要埋点",
+            "补充埋点", "修改埋点", "事件追踪方案", "event_code", "tracking plan",
+            "tracking_plan", "台账查重", "启动埋点", "埋点skill", "埋点 skill",
+        )
+        return any(phrase in source for phrase in strong_phrases)
+
+    def _tracking_plan_turn_needs_guide(self, user_message: str, conversation_history) -> bool:
+        if self._tracking_plan_text_signal(user_message):
+            return True
+        if self._tracking_plan_has_active_workflow():
+            return True
+        current = str(user_message or "").strip().lower()
+        continuation_phrases = (
+            "继续", "可以", "确认", "同意", "按这个", "就这样", "修改", "更新",
+            "不通过", "重新生成", "原文档", "修改清单", "指标", "字段", "事件",
+            "方案", "文档", "查重", "测试", "好了", "好的",
+        )
+        if not any(phrase in current for phrase in continuation_phrases):
+            return False
+        try:
+            recent = list(conversation_history or [])[-16:]
+            history_text = json.dumps(recent, ensure_ascii=False, default=str)
+        except Exception:
+            history_text = str(conversation_history or "")
+        return (
+            self._tracking_plan_text_signal(history_text)
+            or "mcp_tipsy_tracking_plan_" in history_text
+            or "tracking_plan_start" in history_text
+        )
+
+    def _inject_tracking_plan_guide_for_turn(self, user_message: str, conversation_history) -> bool:
+        """Append the complete guide at API-call time, bypassing stored system prompts."""
+        if not self._tracking_plan_turn_needs_guide(user_message, conversation_history):
+            return False
+        existing = str(getattr(self, "ephemeral_system_prompt", "") or "")
+        if self._TIPSY_TRACKING_GUIDE_MARKER in existing:
+            return True
+        guide_path = get_hermes_home() / "skills" / "tracking-plan-feishu" / "SKILL.md"
+        try:
+            guide = guide_path.read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            logger.warning("tracking-plan runtime guide could not be loaded: %s", type(exc).__name__)
+            return False
+        if not guide:
+            logger.warning("tracking-plan runtime guide is empty")
+            return False
+        injected = (
+            self._TIPSY_TRACKING_GUIDE_MARKER
+            + "\nThe following Markdown is the complete, authoritative method for this turn.\n\n"
+            + guide
+        )
+        self.ephemeral_system_prompt = (existing + "\n\n" + injected).strip()
+        logger.info("tracking-plan runtime guide injected for this turn")
+        return True
+
     def _build_system_prompt_parts(self, system_message: str = None) -> Dict[str, str]:
         """Assemble the system prompt as three ordered parts.
 
@@ -8048,7 +8114,7 @@ class AIAgent:
             # Build mock response matching non-streaming shape
             full_content = "".join(content_parts) or None
             mock_tool_calls = None
-            has_truncated_tool_args = False
+            has_invalid_tool_args = False
             if tool_calls_acc:
                 mock_tool_calls = []
                 for idx in sorted(tool_calls_acc):
@@ -8058,21 +8124,43 @@ class AIAgent:
                     if arguments and arguments.strip():
                         try:
                             json.loads(arguments)
-                        except json.JSONDecodeError:
+                        except json.JSONDecodeError as exc:
+                            # Keep the provider's real finish_reason. Invalid JSON
+                            # can come from model formatting or stream assembly as
+                            # well as a genuine output-token truncation, so it is
+                            # unsafe to relabel every parse failure as "length".
+                            _structural_tail = "".join(
+                                ch if ch in '{}[],:"\\' or ch.isspace() else "x"
+                                for ch in arguments[-200:]
+                            )
+                            logger.warning(
+                                "Invalid streamed tool_call arguments for %s: "
+                                "provider_finish_reason=%r chars=%d "
+                                "json_error=%s line=%d column=%d pos=%d "
+                                "structural_tail=%r",
+                                tool_name,
+                                finish_reason,
+                                len(arguments),
+                                exc.msg,
+                                exc.lineno,
+                                exc.colno,
+                                exc.pos,
+                                _structural_tail,
+                            )
                             # Attempt repair before flagging as truncated.
                             # Models like GLM-5.1 via Ollama produce trailing
                             # commas, unclosed brackets, Python None, etc.
-                            # Without repair, these hit the truncation handler
-                            # and kill the session.  _repair_tool_call_arguments
-                            # returns "{}" for unrepairable args, which is far
-                            # better than a crashed session.
+                            # _repair_tool_call_arguments returns "{}" for
+                            # unrepairable args. Preserve the original in that
+                            # case so the main validation loop can retry safely.
                             repaired = _repair_tool_call_arguments(arguments, tool_name)
                             if repaired != "{}":
                                 # Successfully repaired — use the fixed args
                                 arguments = repaired
                             else:
-                                # Unrepairable — flag for truncation handling
-                                has_truncated_tool_args = True
+                                # Unrepairable — do not execute; let the main loop
+                                # classify and recover from the invalid JSON.
+                                has_invalid_tool_args = True
                     mock_tool_calls.append(SimpleNamespace(
                         id=tc["id"],
                         type=tc["type"],
@@ -8084,8 +8172,12 @@ class AIAgent:
                     ))
 
             effective_finish_reason = finish_reason or "stop"
-            if has_truncated_tool_args:
-                effective_finish_reason = "length"
+            if has_invalid_tool_args:
+                logger.warning(
+                    "Preserving provider finish_reason=%r for invalid tool-call "
+                    "JSON instead of forcing finish_reason='length'",
+                    effective_finish_reason,
+                )
 
             full_reasoning = "".join(reasoning_parts) or None
             mock_message = SimpleNamespace(
@@ -10492,6 +10584,491 @@ class AIAgent:
             parent_agent=self,
         )
 
+
+
+    def _build_lilith_namespaced_memory_context(self, user_message: str, limit: int = 8) -> str:
+        # Build an ephemeral namespaced memory context for current user/chat.
+        try:
+            import sqlite3
+            import re
+            from pathlib import Path
+            from datetime import datetime, timezone
+
+            db_path = Path('/home/hermes/tipsy-data-agent-memory/lilith_memory.sqlite')
+            if not db_path.exists():
+                return ''
+
+            trusted_user_id = str(getattr(self, '_user_id', '') or '').strip()
+            trusted_chat_id = str(getattr(self, '_chat_id', '') or '').strip()
+
+            allowed_scopes = [('global', 'global')]
+            if trusted_user_id:
+                allowed_scopes.append(('user', trusted_user_id))
+            if trusted_chat_id:
+                allowed_scopes.append(('chat', trusted_chat_id))
+
+            if len(allowed_scopes) <= 1:
+                return ''
+
+            now = datetime.now(timezone.utc).isoformat()
+            scope_sql = ' OR '.join(['(scope_type = ? AND scope_id = ?)'] * len(allowed_scopes))
+            params = []
+            for scope_type, scope_id in allowed_scopes:
+                params.extend([scope_type, scope_id])
+            params.append(now)
+
+            sql = (
+                'SELECT scope_type, memory_type, title, content, updated_at '
+                'FROM memory_items '
+                'WHERE is_active = 1 '
+                f'AND ({scope_sql}) '
+                'AND (expires_at IS NULL OR expires_at > ?) '
+                'ORDER BY updated_at DESC '
+                'LIMIT 200'
+            )
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(sql, params).fetchall()
+            finally:
+                conn.close()
+            if not rows:
+                return ''
+
+            msg = str(user_message or '')
+            terms = [t.lower() for t in re.findall(r'[A-Za-z0-9_]{2,}|[\u4e00-\u9fff]{2,}', msg)]
+            stop_terms = {
+                '请', '帮我', '一下', '这个', '那个', '数据', '查询', '看看', '什么',
+                'the', 'and', 'for', 'with', 'this', 'that',
+            }
+            terms = [t for t in terms if t not in stop_terms][:20]
+
+            def score(row):
+                blob = f"{row['title']}\n{row['content']}".lower()
+                s = 0
+                for term in terms:
+                    if term in blob:
+                        s += 2 if term in str(row['title']).lower() else 1
+                if row['memory_type'] in {'preference', 'chat_preference'}:
+                    s += 1
+                return s
+
+            scored = [(score(r), r) for r in rows]
+            positives = [(s, r) for s, r in scored if s > 0]
+            selected = positives[:limit] if positives else scored[:limit]
+            selected = selected[:limit]
+            if not selected:
+                return ''
+
+            lines = [
+                '<Lilith namespaced memory context>',
+                'The following memory items belong only to the current Feishu user/chat. Use them if relevant. Do not reveal internal IDs.',
+            ]
+
+            for s, r in selected:
+                title = str(r['title'] or '').strip()
+                content = str(r['content'] or '').strip()
+                if len(content) > 240:
+                    content = content[:240] + '...'
+                scope_label = 'user' if r['scope_type'] == 'user' else ('chat' if r['scope_type'] == 'chat' else 'global')
+                memory_type = str(r['memory_type'] or '')
+                lines.append(f'- [{scope_label}/{memory_type}] {title}: {content}')
+
+            lines.append('</Lilith namespaced memory context>')
+            return '\n'.join(lines)
+
+        except Exception as exc:
+            try:
+                logger.warning('Lilith auto memory recall failed: %s', exc)
+            except Exception:
+                pass
+            return ''
+
+    def _inject_trusted_identity_for_lilith_memory(self, function_name: str, function_args: dict) -> dict:
+        """
+        Enforce server-side identity for Lilith namespaced memory MCP tools.
+
+        The model may still produce feishu_user_id/chat_id arguments, but this
+        method overwrites them with trusted identity from the current gateway
+        session before the tool actually runs.
+        """
+        if not isinstance(function_args, dict):
+            function_args = {}
+
+        if not str(function_name or "").startswith("mcp_tipsy_lilith_memory_"):
+            return function_args
+
+        args = dict(function_args)
+        trusted_user_id = str(getattr(self, "_user_id", "") or "").strip()
+        trusted_chat_id = str(getattr(self, "_chat_id", "") or "").strip()
+
+        user_scoped_tools = {
+            "mcp_tipsy_lilith_memory_remember_user_preference",
+            "mcp_tipsy_lilith_memory_recall_user_memory",
+            "mcp_tipsy_lilith_memory_forget_user_memory",
+        }
+        chat_scoped_tools = {
+            "mcp_tipsy_lilith_memory_remember_chat_preference",
+            "mcp_tipsy_lilith_memory_recall_chat_memory",
+        }
+        task_scoped_tools = {
+            "mcp_tipsy_lilith_memory_remember_task_state",
+        }
+
+        if function_name in user_scoped_tools:
+            if not trusted_user_id:
+                raise RuntimeError("Blocked Lilith memory tool call: missing trusted sender user id.")
+            args["feishu_user_id"] = trusted_user_id
+            return args
+
+        if function_name in chat_scoped_tools:
+            if not trusted_chat_id:
+                raise RuntimeError("Blocked Lilith chat memory tool call: missing trusted chat id.")
+            args["chat_id"] = trusted_chat_id
+            if trusted_user_id:
+                args["feishu_user_id"] = trusted_user_id
+                args["source_user_id"] = trusted_user_id
+            return args
+
+        if function_name in task_scoped_tools:
+            if trusted_user_id:
+                args["source_user_id"] = trusted_user_id
+            if trusted_chat_id:
+                args["source_chat_id"] = trusted_chat_id
+            return args
+
+        if trusted_user_id:
+            args.setdefault("feishu_user_id", trusted_user_id)
+            args.setdefault("source_user_id", trusted_user_id)
+        if trusted_chat_id:
+            args.setdefault("chat_id", trusted_chat_id)
+            args.setdefault("source_chat_id", trusted_chat_id)
+        return args
+
+
+    def _inject_trusted_identity_for_tipsy_maxcompute_guarded(self, function_name: str, function_args: dict) -> dict:
+        if not isinstance(function_args, dict):
+            function_args = {}
+
+        guarded_tools = {
+            "mcp_tipsy_maxcompute_guarded_query_maxcompute",
+            "mcp_tipsy_maxcompute_guarded_export_maxcompute_excel",
+        }
+        if function_name not in guarded_tools:
+            return function_args
+
+        args = dict(function_args)
+        trusted_user_id = str(getattr(self, "_user_id", "") or "").strip()
+        trusted_chat_id = str(getattr(self, "_chat_id", "") or "").strip()
+
+        if not trusted_user_id:
+            raise RuntimeError("Blocked guarded MaxCompute tool call: missing trusted sender user id.")
+
+        args["caller_user_id"] = trusted_user_id
+        args["caller_chat_id"] = trusted_chat_id
+        return args
+
+
+    def _inject_trusted_identity_for_tipsy_cron(self, function_name: str, function_args: dict) -> dict:
+        if not isinstance(function_args, dict):
+            function_args = {}
+
+        cron_tools = {
+            "mcp_tipsy_cron_create_task",
+            "mcp_tipsy_cron_list_tasks",
+            "mcp_tipsy_cron_update_task",
+            "mcp_tipsy_cron_delete_task",
+            "mcp_tipsy_cron_run_task_now",
+        }
+        if function_name not in cron_tools:
+            return function_args
+
+        args = dict(function_args)
+        trusted_user_id = str(getattr(self, "_user_id", "") or "").strip()
+        trusted_chat_id = str(getattr(self, "_chat_id", "") or "").strip()
+
+        if not trusted_user_id:
+            raise RuntimeError("Blocked tipsy-cron tool call: missing trusted sender user id.")
+
+        args["caller_user_id"] = trusted_user_id
+        args["caller_chat_id"] = trusted_chat_id
+        return args
+
+
+
+
+
+    def _inject_trusted_identity_for_tipsy_feishu_docs(self, function_name: str, function_args: dict) -> dict:
+        if not isinstance(function_args, dict):
+            function_args = {}
+
+        normalized_name = str(function_name or "").replace("-", "_")
+        raw_tools = {
+            "create_feishu_doc",
+            "create_feishu_report_doc",
+            "grant_feishu_doc_access_to_caller",
+        }
+        prefixed_tools = {
+            "mcp_tipsy_feishu_docs_create_feishu_doc",
+            "mcp_tipsy_feishu_report_create_feishu_report_doc",
+            "mcp_tipsy_feishu_docs_grant_feishu_doc_access_to_caller",
+        }
+        is_doc_access_tool = (
+            normalized_name in raw_tools
+            or normalized_name in prefixed_tools
+            or any(normalized_name.endswith("_" + tool) for tool in raw_tools)
+        )
+        if not is_doc_access_tool:
+            return function_args
+
+        args = dict(function_args)
+        trusted_user_id = str(getattr(self, "_user_id", "") or "").strip()
+        if not trusted_user_id.startswith("ou_"):
+            raise RuntimeError(
+                "Blocked Feishu document access tool call: "
+                "missing trusted Feishu sender open_id."
+            )
+
+        # Always overwrite model-supplied identity with the Gateway identity.
+        args["caller_user_id"] = trusted_user_id
+        return args
+
+
+    def _inject_trusted_identity_for_tipsy_permission_bind(self, function_name: str, function_args: dict) -> dict:
+        if not isinstance(function_args, dict):
+            function_args = {}
+
+        normalized_name = str(function_name or "").replace("-", "_")
+
+        raw_tools = {
+            "bind_self",
+            "list_pending_bindings",
+            "approve_pending_binding",
+            "approve_all_pending_bindings",
+            "reject_pending_binding",
+        }
+
+        prefixed_tools = {
+            "mcp_tipsy_permission_bind_bind_self",
+            "mcp_tipsy_permission_bind_list_pending_bindings",
+            "mcp_tipsy_permission_bind_approve_pending_binding",
+            "mcp_tipsy_permission_bind_approve_all_pending_bindings",
+            "mcp_tipsy_permission_bind_reject_pending_binding",
+        }
+
+        is_permission_bind_tool = (
+            normalized_name in raw_tools
+            or normalized_name in prefixed_tools
+            or any(normalized_name.endswith("_" + t) for t in raw_tools)
+            or "permission_bind" in normalized_name
+        )
+
+        if not is_permission_bind_tool:
+            return function_args
+
+        args = dict(function_args)
+
+        def _is_feishu_open_id(value) -> bool:
+            return isinstance(value, str) and value.strip().startswith("ou_")
+
+        def _is_feishu_chat_id(value) -> bool:
+            return isinstance(value, str) and value.strip().startswith("oc_")
+
+        def _pick_scalar_from_attrs(pred, candidate_names):
+            for name in candidate_names:
+                try:
+                    value = getattr(self, name, None)
+                except Exception:
+                    value = None
+                if pred(value):
+                    return value.strip()
+
+            try:
+                items = list(vars(self).items())
+            except Exception:
+                items = []
+
+            key_words = ("user", "sender", "open", "feishu", "chat")
+            for key, value in items:
+                lk = str(key).lower()
+                if not any(w in lk for w in key_words):
+                    continue
+
+                if pred(value):
+                    return value.strip()
+
+                if isinstance(value, dict):
+                    for k2, v2 in value.items():
+                        lk2 = str(k2).lower()
+                        if any(w in lk2 for w in key_words) and pred(v2):
+                            return v2.strip()
+            return ""
+
+        trusted_user_id = _pick_scalar_from_attrs(
+            _is_feishu_open_id,
+            [
+                "_user_id", "user_id",
+                "_sender_user_id", "sender_user_id",
+                "_sender_id", "sender_id",
+                "_open_id", "open_id",
+                "_feishu_user_id", "feishu_user_id",
+                "_current_user_id", "current_user_id",
+                "_operator_user_id", "operator_user_id",
+            ],
+        )
+
+        trusted_chat_id = _pick_scalar_from_attrs(
+            _is_feishu_chat_id,
+            [
+                "_chat_id", "chat_id",
+                "_conversation_id", "conversation_id",
+                "_feishu_chat_id", "feishu_chat_id",
+                "_current_chat_id", "current_chat_id",
+            ],
+        )
+
+        if not trusted_user_id:
+            try:
+                attr_keys = sorted([str(k) for k in vars(self).keys()])
+                print(
+                    "[tipsy-permission-bind] matched tool but missing trusted user id; "
+                    f"tool={function_name}; normalized={normalized_name}; attr_keys={attr_keys[:100]}"
+                )
+            except Exception:
+                pass
+            raise RuntimeError("Blocked tipsy-permission-bind tool call: missing trusted sender user id.")
+
+        args["caller_user_id"] = trusted_user_id
+        args["caller_chat_id"] = trusted_chat_id
+        return args
+
+
+
+    def _inject_trusted_identity_for_tipsy_tracking_plan(self, function_name: str, function_args: dict) -> dict:
+        if not isinstance(function_args, dict):
+            function_args = {}
+
+        normalized_name = str(function_name or "").replace("-", "_")
+        raw_tools = {
+            "tracking_plan_start",
+            "tracking_plan_get",
+            "tracking_plan_save",
+            "search_tracking_events",
+            "get_tracking_event",
+            "create_tracking_plan_doc",
+            "update_tracking_plan_doc",
+        }
+        prefixed_tools = {
+            "mcp_tipsy_tracking_plan_tracking_plan_start",
+            "mcp_tipsy_tracking_plan_tracking_plan_get",
+            "mcp_tipsy_tracking_plan_tracking_plan_save",
+            "mcp_tipsy_tracking_plan_search_tracking_events",
+            "mcp_tipsy_tracking_plan_get_tracking_event",
+            "mcp_tipsy_tracking_plan_create_tracking_plan_doc",
+            "mcp_tipsy_tracking_plan_update_tracking_plan_doc",
+        }
+        is_tracking_plan_tool = (
+            normalized_name in raw_tools
+            or normalized_name in prefixed_tools
+            or any(normalized_name.endswith("_" + tool) for tool in raw_tools)
+        )
+        if not is_tracking_plan_tool:
+            return function_args
+
+        trusted_user_id = str(getattr(self, "_user_id", "") or "").strip()
+        trusted_chat_id = str(getattr(self, "_chat_id", "") or "").strip()
+        if not trusted_user_id.startswith("ou_"):
+            raise RuntimeError(
+                "Blocked tipsy-tracking-plan tool call: "
+                "missing trusted Feishu sender open_id."
+            )
+        if trusted_chat_id and not trusted_chat_id.startswith("oc_"):
+            raise RuntimeError(
+                "Blocked tipsy-tracking-plan tool call: "
+                "invalid trusted Feishu chat id."
+            )
+
+        args = dict(function_args)
+        args["caller_user_id"] = trusted_user_id
+        args["caller_chat_id"] = trusted_chat_id
+        return args
+
+    def _inject_trusted_identity_for_tipsy_python_modeling(self, function_name: str, function_args: dict) -> dict:
+        if not isinstance(function_args, dict):
+            function_args = {}
+
+        normalized_name = str(function_name or "").replace("-", "_")
+        raw_tools = {"python_modeling_healthcheck", "run_python_modeling", "list_modeling_outputs", "read_modeling_file"}
+        prefixed_tools = {
+            "mcp_tipsy_python_modeling_python_modeling_healthcheck",
+            "mcp_tipsy_python_modeling_run_python_modeling",
+            "mcp_tipsy_python_modeling_list_modeling_outputs",
+            "mcp_tipsy_python_modeling_read_modeling_file",
+        }
+        is_modeling_tool = (
+            normalized_name in raw_tools
+            or normalized_name in prefixed_tools
+            or any(normalized_name.endswith("_" + t) for t in raw_tools)
+            or "python_modeling" in normalized_name
+        )
+        if not is_modeling_tool:
+            return function_args
+
+        args = dict(function_args)
+
+        def _is_feishu_open_id(value) -> bool:
+            return isinstance(value, str) and value.strip().startswith("ou_")
+
+        def _is_feishu_chat_id(value) -> bool:
+            return isinstance(value, str) and value.strip().startswith("oc_")
+
+        def _pick_scalar_from_attrs(pred, candidate_names):
+            for name in candidate_names:
+                try:
+                    value = getattr(self, name, None)
+                except Exception:
+                    value = None
+                if pred(value):
+                    return value.strip()
+            try:
+                items = list(vars(self).items())
+            except Exception:
+                items = []
+            key_words = ("user", "sender", "open", "feishu", "chat")
+            for key, value in items:
+                lk = str(key).lower()
+                if not any(w in lk for w in key_words):
+                    continue
+                if pred(value):
+                    return value.strip()
+                if isinstance(value, dict):
+                    for k2, v2 in value.items():
+                        lk2 = str(k2).lower()
+                        if any(w in lk2 for w in key_words) and pred(v2):
+                            return v2.strip()
+            return ""
+
+        trusted_user_id = _pick_scalar_from_attrs(
+            _is_feishu_open_id,
+            ["_user_id", "user_id", "_sender_user_id", "sender_user_id", "_sender_id", "sender_id", "_open_id", "open_id", "_feishu_user_id", "feishu_user_id", "_current_user_id", "current_user_id", "_operator_user_id", "operator_user_id"],
+        )
+        trusted_chat_id = _pick_scalar_from_attrs(
+            _is_feishu_chat_id,
+            ["_chat_id", "chat_id", "_conversation_id", "conversation_id", "_feishu_chat_id", "feishu_chat_id", "_current_chat_id", "current_chat_id"],
+        )
+        if not trusted_user_id:
+            try:
+                attr_keys = sorted([str(k) for k in vars(self).keys()])
+                print("[tipsy-python-modeling] missing trusted user id; " f"tool={function_name}; normalized={normalized_name}; attr_keys={attr_keys[:100]}")
+            except Exception:
+                pass
+            raise RuntimeError("Blocked tipsy-python-modeling tool call: missing trusted sender user id.")
+
+        args["caller_user_id"] = trusted_user_id
+        args["caller_chat_id"] = trusted_chat_id
+        return args
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False) -> str:
@@ -10513,6 +11090,17 @@ class AIAgent:
                 pass
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
+
+        try:
+            function_args = self._inject_trusted_identity_for_lilith_memory(function_name, function_args)
+            function_args = self._inject_trusted_identity_for_tipsy_maxcompute_guarded(function_name, function_args)
+            function_args = self._inject_trusted_identity_for_tipsy_cron(function_name, function_args)
+            function_args = self._inject_trusted_identity_for_tipsy_permission_bind(function_name, function_args)
+            function_args = self._inject_trusted_identity_for_tipsy_feishu_docs(function_name, function_args)
+            function_args = self._inject_trusted_identity_for_tipsy_tracking_plan(function_name, function_args)
+            function_args = self._inject_trusted_identity_for_tipsy_python_modeling(function_name, function_args)
+        except Exception as exc:
+            return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
         if function_name == "todo":
             from tools.todo_tool import todo_tool as _todo_tool
@@ -11292,6 +11880,13 @@ class AIAgent:
                     spinner.start()
                 _spinner_result = None
                 try:
+                    function_args = self._inject_trusted_identity_for_lilith_memory(function_name, function_args)
+                    function_args = self._inject_trusted_identity_for_tipsy_maxcompute_guarded(function_name, function_args)
+                    function_args = self._inject_trusted_identity_for_tipsy_cron(function_name, function_args)
+                    function_args = self._inject_trusted_identity_for_tipsy_permission_bind(function_name, function_args)
+                    function_args = self._inject_trusted_identity_for_tipsy_feishu_docs(function_name, function_args)
+                    function_args = self._inject_trusted_identity_for_tipsy_tracking_plan(function_name, function_args)
+                    function_args = self._inject_trusted_identity_for_tipsy_python_modeling(function_name, function_args)
                     function_result = handle_function_call(
                         function_name, function_args, effective_task_id,
                         tool_call_id=tool_call.id,
@@ -11312,6 +11907,13 @@ class AIAgent:
                         self._vprint(f"  {cute_msg}")
             else:
                 try:
+                    function_args = self._inject_trusted_identity_for_lilith_memory(function_name, function_args)
+                    function_args = self._inject_trusted_identity_for_tipsy_maxcompute_guarded(function_name, function_args)
+                    function_args = self._inject_trusted_identity_for_tipsy_cron(function_name, function_args)
+                    function_args = self._inject_trusted_identity_for_tipsy_permission_bind(function_name, function_args)
+                    function_args = self._inject_trusted_identity_for_tipsy_feishu_docs(function_name, function_args)
+                    function_args = self._inject_trusted_identity_for_tipsy_tracking_plan(function_name, function_args)
+                    function_args = self._inject_trusted_identity_for_tipsy_python_modeling(function_name, function_args)
                     function_result = handle_function_call(
                         function_name, function_args, effective_task_id,
                         tool_call_id=tool_call.id,
@@ -11752,6 +12354,9 @@ class AIAgent:
         if isinstance(persist_user_message, str):
             persist_user_message = _sanitize_surrogates(persist_user_message)
 
+        # [2026-08-05] Disabled: tracking-plan Skill injection moved to MCP (tracking-plan-v2).
+        # self._inject_tracking_plan_guide_for_turn(user_message, conversation_history)
+
         # Store stream callback for _interruptible_api_call to pick up
         self._stream_callback = stream_callback
         self._persist_user_message_idx = None
@@ -12047,6 +12652,13 @@ class AIAgent:
                     _ctx_parts.append(str(r["context"]))
                 elif isinstance(r, str) and r.strip():
                     _ctx_parts.append(r)
+            try:
+                _memory_context = self._build_lilith_namespaced_memory_context(original_user_message)
+                if _memory_context:
+                    _ctx_parts.append(_memory_context)
+            except Exception as exc:
+                logger.warning("Lilith namespaced memory context injection failed: %s", exc)
+
             if _ctx_parts:
                 _plugin_user_context = "\n\n".join(_ctx_parts)
         except Exception as exc:
@@ -14625,18 +15237,22 @@ class AIAgent:
                             invalid_json_args.append((tc.function.name, str(e)))
                     
                     if invalid_json_args:
-                        # Check if the invalid JSON is due to truncation rather
-                        # than a model formatting mistake.  Routers sometimes
-                        # rewrite finish_reason from "length" to "tool_calls",
-                        # hiding the truncation from the length handler above.
-                        # Detect truncation: args that don't end with } or ]
-                        # (after stripping whitespace) are cut off mid-stream.
-                        _truncated = any(
+                        # A missing closing delimiter proves the JSON is
+                        # incomplete, but not why. Only classify it as an output
+                        # length failure when the provider explicitly says so;
+                        # otherwise use the normal invalid-JSON retry path.
+                        _missing_closer = any(
                             not (tc.function.arguments or "").rstrip().endswith(("}", "]"))
                             for tc in assistant_message.tool_calls
                             if tc.function.name in {n for n, _ in invalid_json_args}
                         )
-                        if _truncated:
+                        _explicit_length_reason = finish_reason in {
+                            "length",
+                            "max_tokens",
+                            "max_output_tokens",
+                            "incomplete",
+                        }
+                        if _missing_closer and _explicit_length_reason:
                             self._vprint(
                                 f"{self.log_prefix}⚠️  Truncated tool call arguments detected "
                                 f"(finish_reason={finish_reason!r}) — refusing to execute.",
@@ -14653,6 +15269,13 @@ class AIAgent:
                                 "partial": True,
                                 "error": "Response truncated due to output length limit",
                             }
+                        if _missing_closer:
+                            logger.warning(
+                                "Incomplete tool-call JSON was not classified as "
+                                "token truncation because provider finish_reason=%r; "
+                                "using invalid-JSON recovery",
+                                finish_reason,
+                            )
 
                         # Track retries for invalid JSON arguments
                         self._invalid_json_retries += 1

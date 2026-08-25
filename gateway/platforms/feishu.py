@@ -546,6 +546,154 @@ def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
 # ---------------------------------------------------------------------------
 
 
+
+# LILITH_FEISHU_RICH_REPLY_V1
+# Feishu post markdown cannot render pipe tables.  Convert compact chat tables
+# to vertical rich-text sections so one table never downgrades the entire reply
+# to plain text.  Oversized tables remain complete inside a fenced code block.
+_LILITH_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
+_LILITH_MAX_RICH_TABLE_ROWS = 12
+_LILITH_MAX_RICH_TABLE_COLUMNS = 5
+
+
+def _lilith_split_markdown_table_row(line: str) -> Optional[List[str]]:
+    stripped = (line or "").strip()
+    if not (stripped.startswith("|") and stripped.endswith("|")):
+        return None
+
+    body = stripped[1:-1]
+    cells: List[str] = []
+    current: List[str] = []
+    escaped = False
+    in_inline_code = False
+
+    for char in body:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            current.append(char)
+            continue
+        if char == "`":
+            in_inline_code = not in_inline_code
+            current.append(char)
+            continue
+        if char == "|" and not in_inline_code:
+            cells.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+
+    if escaped:
+        current.append("\\")
+    cells.append("".join(current).strip())
+    return cells
+
+
+def _lilith_is_markdown_table_separator(cells: Optional[List[str]]) -> bool:
+    return bool(cells) and all(
+        bool(_LILITH_TABLE_SEPARATOR_CELL_RE.fullmatch(cell.replace(" ", "")))
+        for cell in cells
+    )
+
+
+def _lilith_clean_table_label(value: str) -> str:
+    label = (value or "").strip().replace(r"\|", "|")
+    bold = re.fullmatch(r"\*\*(.+)\*\*", label)
+    return bold.group(1).strip() if bold else label
+
+
+def _lilith_render_table_as_sections(
+    headers: List[str], rows: List[List[str]]
+) -> List[str]:
+    width = max(len(headers), max((len(row) for row in rows), default=0))
+    normalized_headers = list(headers) + [""] * (width - len(headers))
+    rendered: List[str] = []
+
+    for row_index, row in enumerate(rows, start=1):
+        normalized_row = list(row) + [""] * (width - len(row))
+        label = _lilith_clean_table_label(normalized_row[0]) or f"第 {row_index} 项"
+        rendered.append(f"**{label}**")
+
+        for column_index in range(1, width):
+            value = normalized_row[column_index].strip().replace(r"\|", "|")
+            if not value:
+                continue
+            heading = _lilith_clean_table_label(normalized_headers[column_index])
+            if not heading:
+                heading = f"字段 {column_index + 1}"
+            rendered.append(f"- **{heading}：** {value}")
+
+        rendered.append("")
+
+    while rendered and not rendered[-1]:
+        rendered.pop()
+    return rendered
+
+
+def _lilith_render_markdown_tables_for_feishu(content: str) -> str:
+    """Make Markdown tables safe for Feishu rich-post rendering.
+
+    Small tables become vertical sections, which are easier to read in both
+    desktop and mobile chat.  Large or very wide tables are kept verbatim in a
+    fenced block so no data is silently dropped.
+    """
+    lines = (content or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    output: List[str] = []
+    index = 0
+    in_fence = False
+
+    while index < len(lines):
+        line = lines[index]
+        if re.match(r"^\s*```", line):
+            in_fence = not in_fence
+            output.append(line)
+            index += 1
+            continue
+
+        header = _lilith_split_markdown_table_row(line) if not in_fence else None
+        separator = (
+            _lilith_split_markdown_table_row(lines[index + 1])
+            if header is not None and index + 1 < len(lines)
+            else None
+        )
+
+        if header is None or not _lilith_is_markdown_table_separator(separator):
+            output.append(line)
+            index += 1
+            continue
+
+        table_lines = [line, lines[index + 1]]
+        rows: List[List[str]] = []
+        cursor = index + 2
+        while cursor < len(lines):
+            parsed = _lilith_split_markdown_table_row(lines[cursor])
+            if parsed is None:
+                break
+            table_lines.append(lines[cursor])
+            rows.append(parsed)
+            cursor += 1
+
+        if not rows:
+            output.extend(table_lines)
+        elif (
+            len(rows) <= _LILITH_MAX_RICH_TABLE_ROWS
+            and max(len(header), max(len(row) for row in rows))
+            <= _LILITH_MAX_RICH_TABLE_COLUMNS
+        ):
+            output.extend(_lilith_render_table_as_sections(header, rows))
+        else:
+            output.append("```text")
+            output.extend(table_lines)
+            output.append("```")
+
+        index = cursor
+
+    return "\n".join(output).strip()
+
+
 def _build_markdown_post_payload(content: str) -> str:
     rows = _build_markdown_post_rows(content)
     return json.dumps(
@@ -3982,10 +4130,7 @@ class FeishuAdapter(BasePlatformAdapter):
     # --- Mention detection ----------------------------------------------------
 
     def _mentions_self(self, message: Any) -> bool:
-        # @_all is Feishu's @everyone placeholder.
         raw_content = getattr(message, "content", "") or ""
-        if "@_all" in raw_content:
-            return True
         mentions = getattr(message, "mentions", None) or []
         if mentions and self._message_mentions_bot(mentions):
             return True
@@ -4175,15 +4320,13 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
-        # Feishu post-type 'md' elements do not render markdown tables; sending
-        # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
-        if _MARKDOWN_TABLE_RE.search(content):
-            text_payload = {"text": content}
-            return "text", json.dumps(text_payload, ensure_ascii=False)
-        if _MARKDOWN_HINT_RE.search(content):
-            return "post", _build_markdown_post_payload(content)
-        text_payload = {"text": content}
+        # Feishu post markdown cannot render pipe tables.  Previously Hermes
+        # downgraded the whole reply to text, exposing every Markdown marker.
+        # Normalize tables first, then retain rich post rendering.
+        rendered_content = _lilith_render_markdown_tables_for_feishu(content)
+        if _MARKDOWN_HINT_RE.search(rendered_content):
+            return "post", _build_markdown_post_payload(rendered_content)
+        text_payload = {"text": rendered_content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
 
     async def _send_uploaded_file_message(

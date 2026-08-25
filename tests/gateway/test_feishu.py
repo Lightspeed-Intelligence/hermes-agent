@@ -3299,10 +3299,10 @@ class TestDedupTTL(unittest.TestCase):
 
 
 class TestGroupMentionAtAll(unittest.TestCase):
-    """Tests for @_all (Feishu @everyone) group mention routing."""
+    """Tests that @_all never counts as an explicit bot mention."""
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
-    def test_at_all_in_content_accepts_without_explicit_bot_mention(self):
+    def test_at_all_in_content_does_not_count_as_bot_mention(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -3312,11 +3312,10 @@ class TestGroupMentionAtAll(unittest.TestCase):
             mentions=[],
         )
         sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
-        self.assertTrue(_admits_group(adapter, message, sender_id, ""))
+        self.assertFalse(_admits_group(adapter, message, sender_id, ""))
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "allowlist", "FEISHU_ALLOWED_USERS": "ou_allowed"}, clear=True)
-    def test_at_all_still_requires_policy_gate(self):
-        """@_all bypasses mention gating but NOT the allowlist policy."""
+    def test_at_all_is_rejected_even_for_allowlisted_sender(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -3325,9 +3324,27 @@ class TestGroupMentionAtAll(unittest.TestCase):
         # Non-allowlisted user — should be blocked even with @_all.
         blocked_sender = SimpleNamespace(open_id="ou_blocked", user_id=None)
         self.assertFalse(_admits_group(adapter, message, blocked_sender, ""))
-        # Allowlisted user — should pass.
+        # Passing the sender policy is not enough without an explicit bot mention.
         allowed_sender = SimpleNamespace(open_id="ou_allowed", user_id=None)
-        self.assertTrue(_admits_group(adapter, message, allowed_sender, ""))
+        self.assertFalse(_admits_group(adapter, message, allowed_sender, ""))
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_at_all_with_explicit_bot_mention_is_accepted(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._bot_open_id = "ou_bot"
+        bot_mention = SimpleNamespace(
+            name="Lilith",
+            id=SimpleNamespace(open_id="ou_bot", user_id=None),
+        )
+        message = SimpleNamespace(
+            content='{"text":"@_all @_user_1 请注意"}',
+            mentions=[bot_mention],
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertTrue(_admits_group(adapter, message, sender_id, ""))
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
