@@ -4311,7 +4311,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Build mock response matching non-streaming shape
         full_content = "".join(content_parts) or None
         mock_tool_calls = None
-        has_invalid_tool_args = False
+        has_truncated_tool_args = False
         if tool_calls_acc:
             mock_tool_calls = []
             for idx in sorted(tool_calls_acc):
@@ -4322,22 +4322,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     try:
                         json.loads(arguments)
                     except json.JSONDecodeError:
-                        # Attempt repair before flagging the arguments invalid.
+                        # Attempt repair before flagging as truncated.
                         # Models like GLM-5.1 via Ollama produce trailing
                         # commas, unclosed brackets, Python None, etc.
-                        # _repair_tool_call_arguments returns "{}" when it
-                        # cannot recover the original payload.  Keep the raw
-                        # arguments in that case so the conversation loop can
-                        # validate and recover without losing provider
-                        # finish_reason semantics.
+                        # Without repair, these hit the truncation handler
+                        # and kill the session.  _repair_tool_call_arguments
+                        # returns "{}" for unrepairable args, which is far
+                        # better than a crashed session.
                         repaired = _repair_tool_call_arguments(arguments, tool_name)
                         if repaired != "{}":
                             # Successfully repaired — use the fixed args
                             arguments = repaired
                         else:
-                            # Unrepairable — keep the raw arguments for the
-                            # bounded invalid-JSON recovery path.
-                            has_invalid_tool_args = True
+                            # Unrepairable — flag for truncation handling
+                            has_truncated_tool_args = True
                 elif finish_reason is None:
                     # Stream ended with no finish_reason AND this tool call's
                     # arguments never received a single byte (name arrived,
@@ -4350,7 +4348,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # arguments and no retry (#80498). Route it through the
                     # same dropped-mid-tool-call stub path already used for a
                     # truncated-but-nonempty JSON string.
-                    has_invalid_tool_args = True
+                    has_truncated_tool_args = True
                 mock_tool_calls.append(SimpleNamespace(
                     id=tc["id"],
                     type=tc["type"],
@@ -4395,7 +4393,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         #      against.  Route it through the partial-stream-stub path
         #      instead so the loop reports an honest mid-tool-call stream
         #      drop and fails fast rather than escalating output budget.
-        _tool_args_dropped_no_finish = has_invalid_tool_args and finish_reason is None
+        _tool_args_dropped_no_finish = has_truncated_tool_args and finish_reason is None
         if _tool_args_dropped_no_finish:
             _dropped_names = [
                 (tool_calls_acc[idx]["function"]["name"] or "?")
@@ -4436,12 +4434,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
         effective_finish_reason = finish_reason or "stop"
-        if has_invalid_tool_args:
-            logger.warning(
-                "Preserving provider finish_reason=%r for unrepairable "
-                "tool-call JSON instead of inferring an output-length limit.",
-                effective_finish_reason,
-            )
+        if has_truncated_tool_args:
+            effective_finish_reason = "length"
 
         provider_stream_error = _provider_stream_error_from_text(
             full_content or "",

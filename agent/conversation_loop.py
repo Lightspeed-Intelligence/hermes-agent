@@ -7043,22 +7043,18 @@ def run_conversation(
                         invalid_json_args.append((tc.function.name, str(e)))
                 
                 if invalid_json_args:
-                    # A missing closing delimiter proves the JSON is
-                    # incomplete, but not why.  Only classify it as an output
-                    # length failure when the provider explicitly says so;
-                    # otherwise use the bounded invalid-JSON recovery path.
-                    _missing_closer = any(
+                    # Check if the invalid JSON is due to truncation rather
+                    # than a model formatting mistake.  Routers sometimes
+                    # rewrite finish_reason from "length" to "tool_calls",
+                    # hiding the truncation from the length handler above.
+                    # Detect truncation: args that don't end with } or ]
+                    # (after stripping whitespace) are cut off mid-stream.
+                    _truncated = any(
                         not (tc.function.arguments or "").rstrip().endswith(("}", "]"))
                         for tc in assistant_message.tool_calls
                         if tc.function.name in {n for n, _ in invalid_json_args}
                     )
-                    _explicit_length_reason = finish_reason in {
-                        "length",
-                        "max_tokens",
-                        "max_output_tokens",
-                        "incomplete",
-                    }
-                    if _missing_closer and _explicit_length_reason:
+                    if _truncated:
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Truncated tool call arguments detected "
                             f"(finish_reason={finish_reason!r}) — refusing to execute.",
@@ -7079,13 +7075,6 @@ def run_conversation(
                             "partial": True,
                             "error": _final_response,
                         }
-                    if _missing_closer:
-                        logger.warning(
-                            "Incomplete tool-call JSON was not classified as "
-                            "token truncation because provider "
-                            "finish_reason=%r; using invalid-JSON recovery.",
-                            finish_reason,
-                        )
 
                     # Track retries for invalid JSON arguments
                     agent._invalid_json_retries += 1
